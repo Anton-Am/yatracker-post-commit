@@ -1,0 +1,145 @@
+#!/bin/bash
+
+# Added Bitbucket and GitHub links to Yandex.Tracker commits
+# modified by Anton Am <antonamru@gmail.com>
+
+# -----------------------
+# necessary configuration:
+# git config --global user.yatracker-token "YOUR-OAUTH-ТОКЕН" (https://yandex.cloud/ru/docs/tracker/concepts/access#section_about_OAuth)
+# git config --global user.yatracker-org "YOUR-ORG-ID" (https://tracker.yandex.ru/admin/orgs)
+
+# not necessary, but can help with next status transition:
+# git config --global user.yatracker-next-status "NEXT-STATUS" (https://tracker.yandex.ru/admin/statuses)
+# git config --global user.yatracker-next-user-login "NEXT-USER" (https://tracker.yandex.ru/admin/users)
+# -----------------------
+
+apiToken=$(git config user.yatracker-token)
+orgId=$(git config user.yatracker-org)
+nextStatus=$(git config user.yatracker-next-status)
+nextUser=$(git config user.yatracker-next-user-login)
+
+# defaults
+if [[ "$apiToken" == '' ]] || [[ "$orgId" == '' ]]; then
+  echo "====================== ERROR ================================="
+  echo "Please set yatracker-token and organization id (https://yandex.cloud/ru/docs/tracker/concepts/access):"
+  echo ""
+  echo "git config --global user.yatracker-token \"YOUR_TOKEN_ID\""
+  echo "git config --global user.yatracker-org \"YOUR_ORG_ID\""
+  exit 0
+fi
+
+# Find main repo host
+gitRemote=$(git remote get-url --push origin)
+
+# Github https url (https://github.com/owner/project.git)
+if [[ "$gitRemote" == "https://"* ]]; then
+  domain=$(echo "$gitRemote" | awk -F "/" '{print $3}')
+  repo=$(echo "$gitRemote" | awk -F "." '{print $2}' | awk -F "/" '{print $2"/"$3}')
+
+  # Bitbucket https url (https://user@bitbucket.org/owner/project.git)
+  if [[ "$domain" == *"@"* ]]; then
+    domain=$(echo "$domain" | awk -F "@" '{print $2}')
+  fi
+fi
+
+# Github and bitbucket ssh url (git@github.com:owner/project.git || git@bitbucket.org:owner/project.git)
+if [[ "$domain" == "" && "$gitRemote" == "git@"* ]]; then
+  domain=$(echo "$gitRemote" | awk -F ":" '{print $1}' | awk -F "@" '{print $2}')
+  repo=$(echo "$gitRemote" | awk -F ":" '{print $2}' | awk -F "." '{print $1}')
+fi
+
+if [[ "$domain" != "" ]]; then
+
+  if [[ "$domain" == "bitbucket.org" ]]; then
+    commitUrl="https://$domain/$repo/commits/"
+  fi
+
+  if [[ "$domain" == "github.com" ]]; then
+    commitUrl="https://$domain/$repo/commit/"
+  fi
+
+  # hold the closed ticket numbers
+  declare -a closed
+  # hold the ticket numbers that are not closed, just touched
+  declare -a referenced
+  # track whether we're currently closing tickets or just referencing them
+  closes='NO'
+
+  # get the checkin comment for parsing
+  comment=$(git log --pretty=format:"%s %b" -n1)
+  printComment=$(git log --pretty=format:"Внесены изменения <a href=$commitUrl%h>%h</a> в %d со следующим сообщением: <em>%s</em>" -n1)
+  printComment="${printComment//\'/\\\'}"
+
+  # break the commit comment down into words
+  IFS=' ' read -a words <<<"$comment"
+
+  for element in "${words[@]}"; do
+    # if we have a task id, save it to the appropriate array
+    if [[ "$element" == *\#* ]]; then
+      # Extract task ID from the element
+      task_id="${element##\#}"
+      if [[ "${closes}" == "YES" ]]; then
+        closed=("${closed[@]}" "$task_id")
+      else
+        referenced=("${referenced[@]}" "$task_id")
+      fi
+    # or else if we have a "closes" word, set the tracking bool accordingly
+    elif [[ "$element" =~ \[?([Зз]акрыт[ао]?|[Tt]est|[Тт]ест)\]? ]]; then
+      closes='YES'
+    fi
+  done
+
+  # touch the stories we've referenced
+  for element in "${referenced[@]}"; do
+    if [[ "$element" != '' ]]; then
+      curl -X POST https://api.tracker.yandex.net/v2/issues/${element}/comments \
+        -H "Host: api.tracker.yandex.net" \
+        -H "Authorization: OAuth ${apiToken}" \
+        -H "X-Org-ID: ${orgId}" \
+        -H "Content-Type: application/json" \
+        -d "{\"text\": \"${printComment}\"}" >/dev/null 2>&1
+    else
+      echo 'Не удалось определить ID задачи'
+    fi
+  done
+
+  if [[ "$nextStatus" != '' ]]; then
+    # close the tasks we've fixed
+    for element in "${closed[@]}"; do
+      if [[ "$element" != '' ]]; then
+        if [[ "$nextUser" != '' ]]; then
+          curl -X POST https://api.tracker.yandex.net/v2/issues/${element}/transitions/${nextStatus}/_execute \
+            -H "Host: api.tracker.yandex.net" \
+            -H "Authorization: OAuth ${apiToken}" \
+            -H "X-Org-ID: ${orgId}" \
+            -H "Content-Type: application/json" \
+            -v \
+            -d "{\"assignee\": \"${nextUser}\", \"comment\": \"${printComment}\"}" >/dev/null
+        else
+          curl -X POST https://api.tracker.yandex.net/v2/issues/${element}/transitions/${nextStatus}/_execute \
+            -H "Host: api.tracker.yandex.net" \
+            -H "Authorization: OAuth ${apiToken}" \
+            -H "X-Org-ID: ${orgId}" \
+            -H "Content-Type: application/json" \
+            -d "{\"comment\": \"${printComment}\"}" >/dev/null 2>&1
+        fi
+
+      else
+        echo 'Не удалось определить ID задачи'
+      fi
+    done
+  fi
+else
+
+  echo "==================== ERROR ============================"
+  echo "Domain not found. Please check your push origin remote:"
+  echo "git remote get-url --push origin"
+  echo ""
+  echo "Remote examples:"
+  echo "https://github.com/owner/project.git"
+  echo "https://user@bitbucket.org/owner/project.git"
+  echo "git@github.com:owner/project.git"
+  echo "git@bitbucket.org:owner/project.git"
+  exit 0
+
+fi
